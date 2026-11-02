@@ -1,0 +1,152 @@
+name: update
+on:
+  schedule:
+    - cron: 0 6 * * 1
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+
+      - name: Resolve upstream versions
+        id: check
+        run: |
+          DESKTOP_URL=$(
+            curl -s -o /dev/null -w '%{redirect_url}' \
+              "https://appsupport.moonshot.cn/api/app/pkg/latest/windows/download"
+          )
+          DESKTOP_LATEST=$(printf '%s' "$DESKTOP_URL" \
+            | sed -nE 's|.*/kimi_([0-9.]+)\.exe|\1|p')
+          if [ -z "$DESKTOP_LATEST" ]; then
+            echo "Error: Could not resolve latest desktop version" >&2
+            echo "from $DESKTOP_URL" >&2
+            exit 1
+          fi
+
+          WB_BASE="https://cdn.kimi.com/webbridge"
+          WB_FEED=$(
+            curl -fsS "$WB_BASE/chrome-extension-store/latest.json" \
+              | jq -r .version
+          )
+          if [ -z "$WB_FEED" ]; then
+            echo "Error: Could not fetch WebBridge extension feed" >&2
+            exit 1
+          fi
+          WB_LATEST="$WB_FEED"
+          while :; do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+              "$WB_BASE/v${WB_LATEST}/releases/kimi-webbridge-linux-amd64")
+            [ "$CODE" = 200 ] && break
+            WB_LATEST=$(printf '%s' "$WB_LATEST" \
+              | awk -F. '{print $1"."$2"."$3-1}')
+            case "$WB_LATEST" in
+            *.*.-*)
+              echo "Error: No daemon release at or below $WB_FEED" >&2
+              exit 1
+              ;;
+            esac
+          done
+
+          DESKTOP_CURRENT=$(nix eval --raw --file params.nix desktop.version)
+          WB_CURRENT=$(nix eval --raw --file params.nix webbridge.version)
+          {
+            echo "desktop_latest=$DESKTOP_LATEST"
+            echo "desktop_current=$DESKTOP_CURRENT"
+            echo "webbridge_latest=$WB_LATEST"
+            echo "webbridge_current=$WB_CURRENT"
+          } >> "$GITHUB_OUTPUT"
+
+          NEEDS=false
+          [ "$DESKTOP_LATEST" != "$DESKTOP_CURRENT" ] && NEEDS=true
+          [ "$WB_LATEST" != "$WB_CURRENT" ] && NEEDS=true
+          echo "needs=$NEEDS" >> "$GITHUB_OUTPUT"
+          if [ "$NEEDS" = false ]; then
+            echo "Already at desktop $DESKTOP_CURRENT, webbridge $WB_CURRENT"
+          else
+            echo "Update needed:"
+            echo "desktop $DESKTOP_CURRENT -> $DESKTOP_LATEST"
+            echo "webbridge $WB_CURRENT -> $WB_LATEST"
+          fi
+
+      - name: Update params.nix
+        if: steps.check.outputs.needs == 'true'
+        env:
+          DESKTOP_LATEST: ${{ steps.check.outputs.desktop_latest }}
+          DESKTOP_CURRENT: ${{ steps.check.outputs.desktop_current }}
+          WB_LATEST: ${{ steps.check.outputs.webbridge_latest }}
+          WB_CURRENT: ${{ steps.check.outputs.webbridge_current }}
+        run: |
+          DESKTOP_BASE="https://kimi-img.moonshot.cn/app/download/windows"
+          if [ "$DESKTOP_LATEST" != "$DESKTOP_CURRENT" ]; then
+            HASH=$(
+              nix store prefetch-file --json \
+                "$DESKTOP_BASE/kimi_${DESKTOP_LATEST}.exe" | jq -r .hash
+            )
+            H="hash = \"$HASH\";"
+            sed -i -E "/desktop = \{/,/\};/s|hash = \".*\";|$H|" params.nix
+            V="version = \"$DESKTOP_LATEST\";"
+            sed -i -E "/desktop = \{/,/\};/s|version = \".*\";|$V|" params.nix
+          fi
+          WB_BASE="https://cdn.kimi.com/webbridge"
+          if [ "$WB_LATEST" != "$WB_CURRENT" ]; then
+            HASH=$(
+              nix store prefetch-file --json \
+                "$WB_BASE/v${WB_LATEST}/releases/kimi-webbridge-linux-amd64" \
+                | jq -r .hash
+            )
+            H="hash = \"$HASH\";"
+            sed -i -E "/webbridge = \{/,/\};/s|hash = \".*\";|$H|" params.nix
+            V="version = \"$WB_LATEST\";"
+            sed -i -E "/webbridge = \{/,/\};/s|version = \".*\";|$V|" params.nix
+          fi
+          nix eval --json --file params.nix >/dev/null
+          git diff -- params.nix
+
+      - name: Open PR
+        if: steps.check.outputs.needs == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DESKTOP_CURRENT: ${{ steps.check.outputs.desktop_current }}
+          DESKTOP_LATEST: ${{ steps.check.outputs.desktop_latest }}
+          WB_CURRENT: ${{ steps.check.outputs.webbridge_current }}
+          WB_LATEST: ${{ steps.check.outputs.webbridge_latest }}
+        run: |
+          BRANCH="update/kimi-desktop-${DESKTOP_LATEST}-webbridge-${WB_LATEST}"
+          OWNER=${GITHUB_REPOSITORY%%/*}
+          OPEN=$(gh api \
+            "repos/$GITHUB_REPOSITORY/pulls?state=open&head=$OWNER:$BRANCH" \
+            --jq 'length' || echo 0)
+          if [ "${OPEN:-0}" != "0" ]; then
+            echo "PR for $BRANCH is already open"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add params.nix
+          git commit -m "deps: bump kimi-desktop to ${DESKTOP_LATEST},
+          webbridge to ${WB_LATEST}"
+          git push origin "$BRANCH"
+          {
+            echo "Auto-generated from Moonshot AI CDN."
+            echo
+            echo "**Kimi Desktop** ${DESKTOP_CURRENT} → ${DESKTOP_LATEST}"
+            echo "**WebBridge** ${WB_CURRENT} → ${WB_LATEST}"
+            echo
+            echo "Release notes:"
+            echo "https://www.kimi.com/en/help/kimi-work/release-notes"
+          } | gh pr create --base main --head "$BRANCH" \
+            --title "deps: bump kimi-desktop to ${DESKTOP_LATEST},
+          webbridge to ${WB_LATEST}" \
+            --body-file -
+          gh workflow run check.yml --ref "$BRANCH"
